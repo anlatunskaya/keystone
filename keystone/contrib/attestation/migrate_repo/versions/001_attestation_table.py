@@ -32,7 +32,7 @@ def upgrade(migrate_engine):
         sql.Column('hostname', sql.String(64)),
         sql.Column('PCRs', sql.String(255)),
         sql.Column('auth_type', sql.String(64)),
-        sql.Column('user_id', sql.String(64)),        
+        sql.Column('service_id', sql.String(64)),        
         sql.Column('uuid', sql.String(64)),
         sql.Column('pkey', sql.Text()),
         sql.Column('pure_hash', sql.Text()),

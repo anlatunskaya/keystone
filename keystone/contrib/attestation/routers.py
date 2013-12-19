@@ -15,6 +15,11 @@ class AttestationExtension(wsgi.ExtensionRouter):
             action='create_entry',
             conditions=dict(method=['POST']))
         mapper.connect(
+            '/attestation/find',
+            controller=attestation_controller,
+            action='find_entry',
+            conditions=dict(method=['PUT', 'POST']))
+        mapper.connect(
             '/attestation/{entity_id}',
             controller=attestation_controller,
             action='update_entry',

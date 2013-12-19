@@ -28,6 +28,7 @@ import uuid
 
 from keystone.common import sql
 from keystone.common import controller
+from keystone import service
 
 
 CONF = config.CONF
@@ -52,13 +53,13 @@ extension.register_admin_extension(extension_data['alias'], extension_data)
 class AttestationKey(sql.ModelBase, sql.DictBase):
     __tablename__ = 'attestation_keys'
     attributes = ['id', 'hostname',
-                  'PCRs', 'auth_type', 'user_id',
+                  'PCRs', 'auth_type', 'service_id',
                   'uuid', 'pkey', 'pure_hash', 'latest_salt', 'salted_hash', 'issued_at', 'extra']
     id = sql.Column(sql.String(64), primary_key=True, nullable=False)
     hostname = sql.Column(sql.String(64), nullable=False)
     PCRs = sql.Column(sql.String(255), nullable=True)
     auth_type = sql.Column(sql.String(64), nullable=True)
-    user_id = sql.Column(sql.String(64), sql.ForeignKey('user.id'), nullable=False, index=True)
+    service_id = sql.Column(sql.String(64), sql.ForeignKey('service.id'), nullable=False, index=True)
     uuid = sql.Column(sql.String(64), nullable=False)
     pkey = sql.Column(sql.Text(), nullable=False)
     pure_hash = sql.Column(sql.Text(), nullable=False)
@@ -69,11 +70,11 @@ class AttestationKey(sql.ModelBase, sql.DictBase):
 
 
 class Attestationdb(sql.Base):
-    def add_key(self, key_dict, user_id):
+    def add_key(self, key_dict, service_id):
         session = self.get_session()
         id=uuid.uuid4().hex
         with session.begin():
-            key = AttestationKey(id=id,hostname=key_dict['hostname'],PCRs=str(key_dict['PCRs']),auth_type=key_dict['auth_type'],user_id=user_id,uuid=key_dict['uuid'],pkey=key_dict['pkey'],
+            key = AttestationKey(id=id,hostname=key_dict['hostname'],PCRs=str(key_dict['PCRs']),auth_type=key_dict['auth_type'],service_id=service_id,uuid=key_dict['uuid'],pkey=key_dict['pkey'],
                 pure_hash=key_dict['pure_hash'],latest_salt=None,salted_hash=None,issued_at=None)
             session.add(key)
             session.flush()
@@ -81,10 +82,16 @@ class Attestationdb(sql.Base):
 
     def get_key(self, **kwargs):
         session = self.get_session()
-        key_entry = session.query(AttestationKey).get(kwargs)
-        return key_entry
+        if 'id' in kwargs:
+            key_entry = session.query(AttestationKey).filter_by(service_id=kwargs['id']).first()
+        else:
+            key_entry = session.query(AttestationKey).filter_by(service_id=kwargs['service_id']).filter_by(hostname=kwargs['hostname']).first()
+        result = {}
+        for column in key_entry.__table__.columns:
+            result[column.name] = getattr(key_entry, column.name)
+        return result
 
-@dependency.requires('assignment_api')
+@dependency.requires('assignment_api', 'catalog_api')
 class AttestationController(controller.V3Controller):
     def __init__(self):
         self.identity_api = identity.Manager()
@@ -92,14 +99,21 @@ class AttestationController(controller.V3Controller):
         self.token_api = token.Manager()
         super(AttestationController, self).__init__()
 
+    def _validate(self,id,quotedhash):
+        return False
+
     @controller.protected()
     def create_entry(self, context, key_data):
         self.assert_admin(context)
         token_id = context.get('token_id')
         token_ref = self.token_api.get_token(token_id)
-        user_id_from_token = token_ref['user']['id']
+        services = self.catalog_api.list_services()
+        service_id = None
+        for srv in services:
+          if srv['type'] == key_data['service']:
+            service_id = srv['id']
         db=Attestationdb()
-        id = db.add_key(key_data,user_id_from_token)
+        id = db.add_key(key_data,service_id)
         return { "key_id": id }
     def update_entry(self, data):
         raise exception.NotImplemented()
@@ -107,4 +121,15 @@ class AttestationController(controller.V3Controller):
         raise exception.NotImplemented()
     def get_entry(self, context, entity_id):
         raise exception.NotImplemented()
+    def find_entry(self, context, key_data):
+        services = self.catalog_api.list_services()
+        service_id = None
+        for srv in services:
+          if srv['type'] == key_data['service']:
+            service_id = srv['id']
+        db=Attestationdb()
+        hostname=key_data['hostname']
+        key_entry = db.get_key(service_id=service_id, hostname=hostname)
+        key_entry['PCRs'] = eval(key_entry['PCRs'])
+        return {"key_data":key_entry}
 
