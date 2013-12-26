@@ -24,8 +24,15 @@ from keystone.openstack.common import log as logging
 from keystone import policy
 from keystone import token
 from keystone.common import dependency
-import uuid
 
+from keystone.openstack.common import processutils
+import uuid
+import base64
+import shutil
+import tempfile
+import hashlib
+import time
+import datetime
 from keystone.common import sql
 from keystone.common import controller
 from keystone import service
@@ -83,7 +90,7 @@ class Attestationdb(sql.Base):
     def get_key(self, **kwargs):
         session = self.get_session()
         if 'id' in kwargs:
-            key_entry = session.query(AttestationKey).filter_by(service_id=kwargs['id']).first()
+            key_entry = session.query(AttestationKey).filter_by(id=kwargs['id']).first()
         else:
             key_entry = session.query(AttestationKey).filter_by(service_id=kwargs['service_id']).filter_by(hostname=kwargs['hostname']).first()
         result = {}
@@ -91,16 +98,59 @@ class Attestationdb(sql.Base):
             result[column.name] = getattr(key_entry, column.name)
         return result
 
+    def update_key(self, id, **kwargs):
+        session = self.get_session()
+        with session.begin():
+            key_entry = session.query(AttestationKey).get(id)
+            key_entry.update(kwargs)
+        return True
+
 @dependency.requires('assignment_api', 'catalog_api')
 class AttestationController(controller.V3Controller):
     def __init__(self):
         self.identity_api = identity.Manager()
         self.policy_api = policy.Manager()
         self.token_api = token.Manager()
+        self.db = Attestationdb()
         super(AttestationController, self).__init__()
 
-    def _validate(self,id,quotedhash):
-        return False
+    def _validate(self, salted_hash, pkey, pure_hash, salt):
+        try:
+            tmp_dir = tempfile.mkdtemp()
+            open(tmp_dir+'/key','w+').write(base64.b64decode(pkey))
+            open(tmp_dir+'/purehash','w+').write(base64.b64decode(pure_hash))
+            open(tmp_dir+'/nonce','w+').write(hashlib.sha1(salt).digest())
+            open(tmp_dir+'/salted_hash','w+').write(base64.b64decode(salted_hash))
+            processutils.execute('tpm_verifyquote', tmp_dir+'/key', tmp_dir+'/purehash', tmp_dir+'/nonce', tmp_dir+'/salted_hash')
+            shutil.rmtree(tmp_dir)
+            return True
+        except:
+            return False
+
+    def _is_valid(self, entity_id):
+        key_entry = self.db.get_key(id=entity_id)
+        current_timestamp = time.time()
+        if key_entry['issued_at'] != None:
+            issued_timestamp = time.mktime(key_entry['issued_at'].timetuple())
+        else:
+            issued_timestamp = 0
+        return current_timestamp - issued_timestamp < 60
+
+
+    @controller.protected()
+    def is_valid(self, context, entity_id):
+        return { "valid":  self._is_valid(entity_id) }
+
+    def validate(self, context, key_data):
+        key_id = key_data['id']
+        key_entry = self.db.get_key(id=key_data['id'])
+        if key_data['salt'] == key_entry['latest_salt']:
+            #we're not going to validate same salt twice
+            return False
+        is_valid = self._validate(key_data['salted_hash'], key_entry['pkey'], key_entry['pure_hash'], key_data['salt'])
+        if is_valid:
+            self.db.update_key(id = key_data['id'], salted_hash=key_data['salted_hash'], latest_salt=key_data['salt'], issued_at=datetime.datetime.now())
+        return {"key_data": { "id":key_entry['id'], "uuid":key_entry['uuid'], "PCRs":key_entry['PCRs'], 'valid': is_valid}}
 
     @controller.protected()
     def create_entry(self, context, key_data):
@@ -112,8 +162,7 @@ class AttestationController(controller.V3Controller):
         for srv in services:
           if srv['type'] == key_data['service']:
             service_id = srv['id']
-        db=Attestationdb()
-        id = db.add_key(key_data,service_id)
+        id = self.db.add_key(key_data,service_id)
         return { "key_id": id }
     def update_entry(self, data):
         raise exception.NotImplemented()
@@ -127,9 +176,9 @@ class AttestationController(controller.V3Controller):
         for srv in services:
           if srv['type'] == key_data['service']:
             service_id = srv['id']
-        db=Attestationdb()
         hostname=key_data['hostname']
-        key_entry = db.get_key(service_id=service_id, hostname=hostname)
+        key_entry = self.db.get_key(service_id=service_id, hostname=hostname)
         key_entry['PCRs'] = eval(key_entry['PCRs'])
-        return {"key_data":key_entry}
+        key_entry['valid'] = self._is_valid(key_entry['id'])
+        return {"key_data": { "id":key_entry['id'], "uuid":key_entry['uuid'], "PCRs":key_entry['PCRs'], 'valid': key_entry['valid']}}
 
